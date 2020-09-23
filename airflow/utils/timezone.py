@@ -145,7 +145,8 @@ def make_naive(value, timezone=None):
     if is_naive(value):
         raise ValueError("make_naive() cannot be applied to a naive datetime")
 
-    o = value.astimezone(timezone)
+    # o = value.astimezone(timezone)
+    o = value.astimezone(pendulum.timezone("UTC"))
 
     # cross library compatibility
     naive = dt.datetime(o.year,
