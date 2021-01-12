@@ -61,6 +61,13 @@ from airflow.utils.mixins import MultiprocessingStartMethodMixin
 from airflow.utils.log.logging_mixin import LoggingMixin, StreamLogWriter, set_context
 from airflow.utils.state import State
 
+from typing import List
+from airflow import DAG
+from airflow.models import DagModel, DagBag
+from airflow.models.serialized_dag import SerializedDagModel
+from airflow.settings import MIN_SERIALIZED_DAG_UPDATE_INTERVAL
+from sqlalchemy.orm import Session
+
 
 class DagFileProcessor(AbstractDagFileProcessor, LoggingMixin, MultiprocessingStartMethodMixin):
     """Helps call SchedulerJob.process_file() in a separate process.
@@ -1605,8 +1612,15 @@ class SchedulerJob(BaseJob):
             return [], len(dagbag.import_errors)
 
         # Save individual DAGs in the ORM and update DagModel.last_scheduled_time
-        for dag in dagbag.dags.values():
-            dag.sync_to_db()
+#        for dag in dagbag.dags.values():
+#            dag.sync_to_db()
+
+        is_gemini = set(map(lambda x: x.startswith("gemini_task_"), dagbag.dags.keys())) == {True}
+        if is_gemini:
+            self._sync_dags_to_db(dagbag)
+        else:
+            for dag in dagbag.dags.values():
+                dag.sync_to_db()
 
         paused_dag_ids = models.DagModel.get_paused_dag_ids(dag_ids=dagbag.dag_ids)
 
@@ -1685,3 +1699,54 @@ class SchedulerJob(BaseJob):
     @provide_session
     def heartbeat_callback(self, session=None):
         Stats.incr('scheduler_heartbeat', 1, 1)
+
+    @provide_session
+    def _sync_dags_to_db(self, dagbag: DagBag, session: Session=None) -> None:
+        '''
+        sync to db for gemini dag
+        '''
+        orm_dags: List[DagModel] = session.query(DagModel).filter(DagModel.dag_id.in_(dagbag.dags.keys())).all()
+        orm_dag_ids = [dag.dag_id for dag in orm_dags]
+
+        new_orm_dags = []
+
+        start_time = time.time()
+
+        def _update_orm_dag(orm_dag: DagModel, dag: DAG) -> DagModel:
+            orm_dag.is_subdag = False
+            orm_dag.fileloc = dag.fileloc
+            orm_dag.owners = dag.owner
+            orm_dag.is_active = True
+            orm_dag.last_scheduler_run = timezone.utcnow()
+            orm_dag.default_view = dag._default_view
+            orm_dag.description = dag.description
+            orm_dag.schedule_interval = dag.schedule_interval
+            orm_dag.tags = []
+
+            return orm_dag
+
+        for orm_dag in orm_dags:
+            dag: DAG = dagbag.dags[orm_dag.dag_id]
+
+            new_orm_dags.append(_update_orm_dag(orm_dag, dag))
+
+        for dag in [dag for dag in dagbag.dags.values() if dag.dag_id not in orm_dag_ids]:
+            orm_dag = DagModel(dag_id=dag.dag_id)
+            self.log.info(f"Creating ORM DAG for {dag.dag_id}")
+            orm_dag.is_paused = True
+
+            new_orm_dags.append(_update_orm_dag(orm_dag, dag))
+
+        session.add_all(new_orm_dags)
+        session.commit()
+
+        self.log.info(f"sync to db DagModel took {round(time.time() - start_time, 2)} seconds")
+
+        start_time = time.time()
+        for dag in dagbag.dags.values():
+            SerializedDagModel.write_dag(
+                dag,
+                min_update_interval=MIN_SERIALIZED_DAG_UPDATE_INTERVAL * 10,
+                session=session
+            )
+        self.log.info(f"sync to db SerializedDagModel took {round(time.time() - start_time, 2)} seconds")
